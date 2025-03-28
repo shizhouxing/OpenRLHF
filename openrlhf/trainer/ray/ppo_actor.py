@@ -9,6 +9,7 @@ import ray
 import torch
 import torch.distributed
 from torch.utils.data import DataLoader
+from torch.multiprocessing.reductions import reduce_tensor
 from tqdm import tqdm
 from transformers.trainer import get_scheduler
 
@@ -496,42 +497,112 @@ class ActorPPOTrainer(BasePPOTrainer):
 
         torch.cuda.empty_cache()
         model = self.actor.model.module
-        count, num_params = 0, len(list(model.named_parameters()))
-        for name, param in model.named_parameters():
-            count += 1  # empty_cache at last param
 
-            # broadcast
-            if not self.use_cuda_ipc:
-                use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
-                # Fire all vllm engines for broadcast
-                if torch.distributed.get_rank() == 0:
-                    shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
-                    refs = [
-                        engine.update_weight.remote(
-                            name, dtype=param.dtype, shape=shape, empty_cache=count == num_params
-                        )
-                        for engine in self.vllm_engines
-                    ]
+        if self.strategy.args.lora_rank:
+            self._broadcast_to_vllm_lora(model)
+        else:
+            count, num_params = 0, len(list(model.named_parameters()))
 
-                # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
-                with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
+            for name, param in model.named_parameters():
+                count += 1  # empty_cache at last param
+
+                # broadcast
+                if not self.use_cuda_ipc:
+                    use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
+                    # Fire all vllm engines for broadcast
                     if torch.distributed.get_rank() == 0:
-                        if use_ray:
-                            import ray.util.collective as collective
+                        shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
+                        refs = [
+                            engine.update_weight.remote(
+                                name, dtype=param.dtype, shape=shape, empty_cache=count == num_params
+                            )
+                            for engine in self.vllm_engines
+                        ]
 
-                            collective.broadcast(param.data, 0, group_name=self._model_update_group)
-                        else:
-                            torch.distributed.broadcast(param.data, 0, group=self._model_update_group)
-                        ray.get(refs)
-            # CUDA IPC
-            else:
-                from torch.multiprocessing.reductions import reduce_tensor
+                    # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
+                    with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
+                        if torch.distributed.get_rank() == 0:
+                            if use_ray:
+                                import ray.util.collective as collective
 
-                # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
-                with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
-                    weight = param.data.clone()
-                    ipc_handle = reduce_tensor(weight)
+                                collective.broadcast(param.data, 0, group_name=self._model_update_group)
+                            else:
+                                torch.distributed.broadcast(param.data, 0, group=self._model_update_group)
+                            ray.get(refs)
+                # CUDA IPC
+                else:
+                    # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
+                    with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
+                        weight = param.data.clone()
+                        ipc_handle = reduce_tensor(weight)
 
+                        ipc_handle = {get_physical_gpu_id(): ipc_handle}
+                        ipc_handle_list = [None] * torch.distributed.get_world_size()
+                        torch.distributed.all_gather_object(ipc_handle_list, ipc_handle)
+
+                        if torch.distributed.get_rank() == 0:
+                            ipc_handles = {}
+                            for d in ipc_handle_list:
+                                ipc_handles.update(d)
+
+                            shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
+                            refs = [
+                                engine.update_weight_cuda_ipc.remote(
+                                    name,
+                                    dtype=param.dtype,
+                                    shape=shape,
+                                    ipc_handles=ipc_handles,
+                                    empty_cache=count == num_params,
+                                )
+                                for engine in self.vllm_engines
+                            ]
+                            ray.get(refs)
+                        torch.distributed.barrier()
+                        torch.cuda.synchronize()
+
+        if cache_reset_refs:
+            ray.get(cache_reset_refs)
+        torch.cuda.empty_cache()
+        torch.distributed.barrier()
+
+    def _broadcast_to_vllm_lora(self, model):
+        if not self.use_cuda_ipc:
+            raise NotImplementedError("CUDA IPC is required when LoRA is used")
+
+        count, num_params = 0, len(list(model.named_parameters()))
+        processed = {}
+
+        params = {name: param for name, param in model.named_parameters()}
+        lora_scaling = self.strategy.args.lora_alpha / self.strategy.args.lora_rank
+
+        lora_layers = []
+        for name in params:
+            if name.endswith(".lora_A.default.weight"):
+                assert name.count("lora_A") == 1
+                layer_name = name.replace(".lora_A.default.weight", "")
+                # TODO we assume it should be a linear layer
+                lora_layers.append(layer_name)
+
+        for i, layer_name in enumerate(lora_layers):
+            param_lora_A = params[f"{layer_name}.lora_A.default.weight"]
+            param_lora_B = params[f"{layer_name}.lora_B.default.weight"]
+            base_weight = params[f"{layer_name}.base_layer.weight"]
+
+            with deepspeed.zero.GatheredParameters(
+                [param_lora_A, param_lora_B],
+                enabled=self.strategy.args.zero_stage == 3
+            ):
+                with deepspeed.zero.GatheredParameters(
+                    [base_weight],
+                    enabled=self.strategy.args.zero_stage == 3
+                ):
+                    delta = param_lora_B @ param_lora_A
+
+                    updated_weight = base_weight + delta * lora_scaling
+                    param = updated_weight.data.clone()
+                    empty_cache = i + 1 == len(lora_layers)
+
+                    ipc_handle = reduce_tensor(param)
                     ipc_handle = {get_physical_gpu_id(): ipc_handle}
                     ipc_handle_list = [None] * torch.distributed.get_world_size()
                     torch.distributed.all_gather_object(ipc_handle_list, ipc_handle)
@@ -541,25 +612,25 @@ class ActorPPOTrainer(BasePPOTrainer):
                         for d in ipc_handle_list:
                             ipc_handles.update(d)
 
-                        shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
+                        # This tensor is already a regular tensor, so just use shape directly
+                        shape = param.shape
+
+                        assert layer_name.startswith("base_model.model.")
+                        base_name = layer_name[len("base_model.model."):] + ".weight"
+
                         refs = [
                             engine.update_weight_cuda_ipc.remote(
-                                name,
+                                base_name,
                                 dtype=param.dtype,
                                 shape=shape,
                                 ipc_handles=ipc_handles,
-                                empty_cache=count == num_params,
+                                empty_cache=empty_cache,
                             )
                             for engine in self.vllm_engines
                         ]
                         ray.get(refs)
                     torch.distributed.barrier()
                     torch.cuda.synchronize()
-
-        if cache_reset_refs:
-            ray.get(cache_reset_refs)
-        torch.cuda.empty_cache()
-        torch.distributed.barrier()
 
     def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
         if global_step % args.logging_steps == 0:
