@@ -347,7 +347,8 @@ class RemoteExperienceMaker(BaseExperienceMaker):
                     queries_list.extend(queries)
 
                 if self.custom_reward_func:
-                    r = self.custom_reward_func.remote(queries_list, prompts_list, labels_list)
+                    r = self.custom_reward_func.remote(
+                        queries_list, prompts_list, labels_list, args=args)
                 else:
                     rank = torch.distributed.get_rank() // self.strategy.ring_attn_size
                     rm = self.remote_rm_url[rank % len(self.remote_rm_url)]
