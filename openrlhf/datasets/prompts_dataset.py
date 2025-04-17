@@ -45,6 +45,10 @@ class PromptDataset(Dataset):
         label_key = getattr(self.strategy.args, "label_key", None)
         apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
 
+        if getattr(self.strategy.args, "chat_template", None):
+            print(f"Replacing chat template into: {self.strategy.args.chat_template}")
+            self.tokenizer.chat_template = self.strategy.args.chat_template
+
         if apply_chat_template:
             apply_chat_template = self.tokenizer.apply_chat_template
 
