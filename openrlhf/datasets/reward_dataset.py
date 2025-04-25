@@ -18,9 +18,14 @@ def preprocess_data(
 ) -> str:
     if apply_chat_template:
         if prompt_key:
-            prompt = apply_chat_template(data[prompt_key], tokenize=False, add_generation_prompt=True)
-            chosen = apply_chat_template(data[prompt_key] + data[chosen_key], tokenize=False)[len(prompt) :]
-            rejected = apply_chat_template(data[prompt_key] + data[rejected_key], tokenize=False)[len(prompt) :]
+            if is_dpo:
+                prompt = apply_chat_template(data[prompt_key], tokenize=False, add_generation_prompt=True)
+                chosen = apply_chat_template(data[chosen_key], tokenize=False, end_generation=True)[len(prompt) :]
+                rejected = apply_chat_template(data[rejected_key], tokenize=False, end_generation=True)[len(prompt) :]
+            else:
+                prompt = apply_chat_template(data[prompt_key], tokenize=False, add_generation_prompt=True)
+                chosen = apply_chat_template(data[prompt_key] + data[chosen_key], tokenize=False)[len(prompt) :]
+                rejected = apply_chat_template(data[prompt_key] + data[rejected_key], tokenize=False)[len(prompt) :]
         else:
             prompt = ""
             chosen = apply_chat_template(data[chosen_key], tokenize=False)
@@ -80,6 +85,10 @@ class RewardDataset(Dataset):
         self.chosen_key = getattr(self.strategy.args, "chosen_key", None)
         self.rejected_key = getattr(self.strategy.args, "rejected_key", None)
         self.apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
+
+        if getattr(self.strategy.args, "chat_template", None):
+            print(f"Replacing chat template into: {self.strategy.args.chat_template}")
+            self.tokenizer.chat_template = self.strategy.args.chat_template
 
         if self.apply_chat_template:
             self.apply_chat_template = self.tokenizer.apply_chat_template
