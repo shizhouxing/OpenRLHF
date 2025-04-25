@@ -249,7 +249,7 @@ class DPOTrainer(ABC):
                 )
             if self.save_hf_ckpt:
                 save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
-                self.strategy.save_model(self.model, self.tokenizer, save_path)
+                self.strategy.save_model(self.model, self.tokenizer, save_path, tag)
 
     def evaluate(self, eval_dataloader, steps=0):
         self.model.eval()

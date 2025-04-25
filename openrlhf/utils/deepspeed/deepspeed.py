@@ -16,6 +16,7 @@ from peft import PeftModel, get_peft_model_state_dict
 from torch import distributed as dist
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
+from huggingface_hub import HfApi
 
 from openrlhf.models import Actor
 from openrlhf.models.ring_attn_utils import get_ring_attn_group, set_ring_attn_group
@@ -309,7 +310,7 @@ class DeepspeedStrategy(ABC):
             state_dict = key_replace_fn(state_dict)
         unwrapped_model.load_state_dict(state_dict, strict=strict)
 
-    def save_model(self, model: nn.Module, tokenizer, output_dir, **kwargs) -> None:
+    def save_model(self, model: nn.Module, tokenizer, output_dir, tag=None, **kwargs) -> None:
         if self.is_rank_0():
             os.makedirs(output_dir, exist_ok=True)
 
@@ -374,6 +375,21 @@ class DeepspeedStrategy(ABC):
                 for filename in os.listdir(train_from_model_path):
                     if filename.endswith(".py"):
                         shutil.copy(os.path.join(train_from_model_path, filename), os.path.join(output_dir, filename))
+
+            # upload the model to HuggingFace Hub
+            if self.args.hub_model_id:
+                try:
+                    api = HfApi()
+                    api.create_repo(self.args.hub_model_id, private=True, exist_ok=True)
+                    api.upload_folder(
+                        folder_path=output_dir,
+                        repo_id=self.args.hub_model_id,
+                        repo_type="model",
+                        commit_message=tag or "upload model",
+                    )
+                except:
+                    print(f"Failed to upload the checkpoint to HuggingFace {self.args.hub_model_id}")
+
         dist.barrier()
         torch.cuda.synchronize()
 
